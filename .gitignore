@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+.env
+.streamlit/secrets.toml
+letcode_codex配置文件.txt
+
+data/downloads/
+data/*.sqlite3-wal
+data/*.sqlite3-shm
+
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
