@@ -103,7 +103,7 @@ class IsaacWikiAgent:
         if history:
             messages.extend(
                 message
-                for message in history[-10:]
+                for message in history[-5:]
                 if message.get("role") in {"user", "assistant"} and message.get("content")
             )
         messages.append({"role": "user", "content": question})

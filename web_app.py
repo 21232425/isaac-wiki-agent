@@ -1,9 +1,13 @@
 # streamlit run web_app.py
 import os
 import secrets
+import inspect
 
 import streamlit as st
 from true_agent import IsaacWikiAgent  # 直接引入你写好的 Agent
+
+
+AGENT_STATE_VERSION = 2
 
 
 def _source_label(retrieved_from: str) -> str:
@@ -12,6 +16,13 @@ def _source_label(retrieved_from: str) -> str:
     if retrieved_from == "remote_api":
         return "在线 Wiki 兜底并已缓存"
     return "来源未知"
+
+
+def _answer_with_history(agent, prompt: str, history: list[dict[str, str]]):
+    parameters = inspect.signature(agent.answer).parameters
+    if "history" in parameters:
+        return agent.answer(prompt, history=history)
+    return agent.answer(prompt)
 
 
 # 设置网页标题和布局
@@ -51,9 +62,14 @@ if not st.session_state.authenticated:
 st.title("👼 以撒的结合 Wiki 智能助手")
 st.caption("基于 DeepSeek 与 Tool-Calling 架构，优先检索本地 Wiki 数据库，未命中时访问 wiki.gg。")
 
-# 初始化或获取 session_state 中的 Agent 实例
-if "agent" not in st.session_state:
+# 初始化或更新 session_state 中的 Agent 实例。
+# 版本号可避免代码热更新后继续使用旧类创建的实例。
+if (
+    "agent" not in st.session_state
+    or st.session_state.get("agent_state_version") != AGENT_STATE_VERSION
+):
     st.session_state.agent = IsaacWikiAgent()
+    st.session_state.agent_state_version = AGENT_STATE_VERSION
 
 # 初始化聊天历史记录
 if "messages" not in st.session_state:
@@ -78,9 +94,10 @@ if prompt := st.chat_input("例如：打通里以撒解锁的那个换道具的�
         with st.spinner("Agent 正在翻阅 Wiki 思考中，请稍候..."):
             try:
                 # 调用 true_agent.py 中的 answer 方法
-                result = st.session_state.agent.answer(
+                result = _answer_with_history(
+                    st.session_state.agent,
                     prompt,
-                    history=st.session_state.messages[:-1],
+                    st.session_state.messages[:-1],
                 )
                 response_text = result.answer
                 
