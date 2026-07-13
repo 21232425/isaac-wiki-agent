@@ -7,7 +7,7 @@ import streamlit as st
 from true_agent import IsaacWikiAgent
 
 
-AGENT_STATE_VERSION = 7
+AGENT_STATE_VERSION = 8
 
 
 def _reference_links(result) -> list[tuple[str, str]]:
@@ -71,7 +71,7 @@ if not st.session_state.authenticated:
 
 # 下方的代码只有在 st.session_state.authenticated 为 True 时才会执行
 st.title("👼 以撒的结合 Wiki 智能助手")
-st.caption("Agent 会根据代码中的联网权限自主选择数据源；当前默认仅查询本地数据库。")
+st.caption("出于保护 Wiki 网站的目的，我不能去爬取 Wiki 数据，只使用本地数据库。")
 
 # 初始化或更新 session_state 中的 Agent 实例。
 # 版本号可避免代码热更新后继续使用旧类创建的实例。
@@ -126,9 +126,10 @@ if prompt := st.chat_input("例如：打通里以撒解锁的那个换道具的�
                 elif getattr(result, "memory_fallback", False):
                     source_summary = "Wiki 数据未命中，本次回答由 Agent 已有的游戏知识补充。"
                 else:
-                    source_summary = "本次未调用 Wiki 数据工具。"
+                    source_summary = ""
 
-                response_text += f"\n\n---\n**数据来源：** {source_summary}"
+                if source_summary:
+                    response_text += f"\n\n---\n**数据来源：** {source_summary}"
                 if reference_links:
                     response_text += "\n\n**Wiki 参考链接：**\n" + "\n".join(
                         f"- [{title}]({url})" for title, url in reference_links
