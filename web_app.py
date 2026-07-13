@@ -4,25 +4,33 @@ import secrets
 import inspect
 
 import streamlit as st
-from true_agent import IsaacWikiAgent  # 直接引入你写好的 Agent
+from true_agent import IsaacWikiAgent, online_search_requested
 
 
-AGENT_STATE_VERSION = 3
+AGENT_STATE_VERSION = 4
 
 
 def _source_label(retrieved_from: str) -> str:
     if retrieved_from == "local_database":
         return "本次从本地数据库读取；链接仅用于原始来源署名"
     if retrieved_from == "remote_api":
-        return "在线 Wiki 兜底并已缓存"
+        return "本次按指令从 wiki.gg 联网读取，并已写入缓存"
     return "来源未知"
 
 
-def _answer_with_history(agent, prompt: str, history: list[dict[str, str]]):
+def _answer_with_history(
+    agent,
+    prompt: str,
+    history: list[dict[str, str]],
+    allow_online: bool,
+):
     parameters = inspect.signature(agent.answer).parameters
+    keyword_arguments = {}
     if "history" in parameters:
-        return agent.answer(prompt, history=history)
-    return agent.answer(prompt)
+        keyword_arguments["history"] = history
+    if "allow_online" in parameters:
+        keyword_arguments["allow_online"] = allow_online
+    return agent.answer(prompt, **keyword_arguments)
 
 
 # 设置网页标题和布局
@@ -94,15 +102,17 @@ if prompt := st.chat_input("例如：打通里以撒解锁的那个换道具的�
         with st.spinner("Agent 正在翻阅 Wiki 思考中，请稍候..."):
             try:
                 # 调用 true_agent.py 中的 answer 方法
+                online_requested = online_search_requested(prompt)
                 result = _answer_with_history(
                     st.session_state.agent,
                     prompt,
                     st.session_state.messages[:-1],
+                    allow_online=online_requested,
                 )
                 response_text = result.answer
 
-                if getattr(result, "online_requested", False):
-                    query_mode = "联网模式（本地未命中时允许访问 wiki.gg）"
+                if online_requested:
+                    query_mode = "联网模式（按指令强制访问 wiki.gg，并更新本地缓存）"
                 else:
                     query_mode = "本地数据库模式（未授权访问网页）"
                 response_text += f"\n\n**本次查询模式：** {query_mode}"

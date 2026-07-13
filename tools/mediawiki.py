@@ -53,9 +53,11 @@ def search_wiki(
     limit: int = 5,
     allow_remote: bool = False,
 ) -> list[SearchResult]:
-    """Search SQLite and only use MediaWiki when explicitly allowed."""
-    local_results = search_pages(query, limit=limit)
-    if local_results:
+    """Use SQLite by default, or force MediaWiki when online mode is enabled."""
+    if not allow_remote:
+        local_results = search_pages(query, limit=limit)
+        if not local_results:
+            return []
         return [
             SearchResult(
                 title=page.title,
@@ -67,9 +69,6 @@ def search_wiki(
             )
             for page in local_results
         ]
-
-    if not allow_remote:
-        return []
 
     errors: list[str] = []
     merged: list[SearchResult] = []
@@ -106,23 +105,21 @@ def search_wiki(
                     retrieved_from="remote_api",
                 )
             )
-            if len(merged) >= limit:
-                return merged
 
     if merged:
-        return merged
+        merged.sort(key=lambda result: _remote_search_score(result, query), reverse=True)
+        return merged[:limit]
     if errors:
         raise WikiApiError("；".join(errors))
     return []
 
 
 def get_wiki_page(title: str, allow_remote: bool = False) -> WikiPage:
-    """Read SQLite first and fetch remotely only when explicitly allowed."""
-    local_page = get_page(title)
-    if local_page is not None:
-        return _stored_to_wiki_page(local_page, retrieved_from="local_database")
-
+    """Read SQLite by default, or force a fresh MediaWiki read in online mode."""
     if not allow_remote:
+        local_page = get_page(title)
+        if local_page is not None:
+            return _stored_to_wiki_page(local_page, retrieved_from="local_database")
         raise WikiApiError(f"本地数据库没有页面：{title}；当前查询未启用联网模式")
 
     errors: list[str] = []
@@ -231,6 +228,22 @@ def _matching_snippet(text: str, query: str, max_chars: int = 260) -> str:
     if start + max_chars < len(text):
         snippet += "..."
     return snippet
+
+
+def _remote_search_score(result: SearchResult, query: str) -> tuple[int, int, int, int, int]:
+    normalized_query = re.sub(r"\s+", " ", query).casefold().strip()
+    normalized_title = re.sub(r"\s+", " ", result.title).casefold().strip()
+    tokens = re.findall(r"[\w\u3400-\u9fff']+", normalized_query)
+    title_matches = sum(token in normalized_title for token in tokens)
+    snippet = result.snippet.casefold()
+    snippet_matches = sum(token in snippet for token in tokens)
+    return (
+        int(normalized_title == normalized_query),
+        int(bool(tokens) and title_matches == len(tokens)),
+        int(normalized_title.startswith(normalized_query)),
+        title_matches,
+        snippet_matches,
+    )
 
 
 def _clean_html(text: str) -> str:

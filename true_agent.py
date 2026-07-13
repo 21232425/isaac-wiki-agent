@@ -24,7 +24,7 @@ SYSTEM_PROMPT = """你是一个精通《以撒的结合：忏悔》的资深 Wik
 
 【数据源架构】
 1. 默认模式是严格离线：search_wiki 和 read_wiki_page 只读取本地 SQLite 数据库。
-2. 只有用户在当前问题中明确要求“联网搜索、上网查、在线查询”等操作时，程序才允许在本地未命中后访问 wiki.gg API。
+2. 只有用户在当前问题中明确要求“联网搜索、上网查、在线查询”等操作时，程序才切换为联网模式，并强制从 wiki.gg 获取当前内容。
 3. 在线读取成功后会自动写回本地数据库，供后续查询复用。
 4. 工具结果会明确给出“来源路径”。回答信息来源问题时必须以该字段为准，不得声称程序没有本地数据库能力。
 
@@ -95,11 +95,16 @@ class IsaacWikiAgent:
         self,
         question: str,
         history: list[dict[str, str]] | None = None,
+        allow_online: bool | None = None,
     ) -> AgentAnswer:
         # 用于追踪本次对话中大模型调用了哪些结果，保留你原有的数据结构返回
         accumulated_search_results: list[SearchResult] = []
         accumulated_pages: list[WikiPage] = []
-        online_requested = _online_search_requested(question)
+        online_requested = (
+            online_search_requested(question)
+            if allow_online is None
+            else allow_online
+        )
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
@@ -115,12 +120,13 @@ class IsaacWikiAgent:
         final_answer_text = ""
 
         try:
-            for _ in range(max_iterations):
+            for iteration in range(max_iterations):
+                final_iteration = iteration == max_iterations - 1
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     tools=self.tools,
-                    tool_choice="auto"
+                    tool_choice="none" if final_iteration else "auto",
                 )
                 
                 response_message = response.choices[0].message
@@ -173,9 +179,6 @@ class IsaacWikiAgent:
                         "name": function_name,
                         "content": tool_result_str
                     })
-            else:
-                final_answer_text = "代理经过多次搜索与阅读依然未能得出结论，请尝试提供更准确的名称或更具体的问题。"
-
         except APIError as exc:
             final_answer_text = f"调用大模型 API 时发生错误：{exc}\n\n请检查 API Key 状态或网络连通性。"
         except Exception as exc:
@@ -251,11 +254,11 @@ def _source_route_label(retrieved_from: str) -> str:
     if retrieved_from == "local_database":
         return "本地 SQLite 数据库（本次未访问网页）"
     if retrieved_from == "remote_api":
-        return "在线 wiki.gg API（本地未命中后兜底）"
+        return "在线 wiki.gg API（用户明确要求联网）"
     return "未知"
 
 
-def _online_search_requested(question: str) -> bool:
+def online_search_requested(question: str) -> bool:
     normalized = question.casefold().strip()
     offline_phrases = ("不要联网", "不用联网", "禁止联网", "仅本地", "只查本地", "离线查询")
     if any(phrase in normalized for phrase in offline_phrases):
