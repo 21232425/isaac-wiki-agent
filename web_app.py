@@ -7,15 +7,21 @@ import streamlit as st
 from true_agent import IsaacWikiAgent
 
 
-AGENT_STATE_VERSION = 5
+AGENT_STATE_VERSION = 7
 
 
-def _source_label(retrieved_from: str) -> str:
-    if retrieved_from == "local_database":
-        return "本次从本地数据库读取；链接仅用于原始来源署名"
-    if retrieved_from == "remote_api":
-        return "本次由 Agent 从 wiki.gg 联网读取，并已写入缓存"
-    return "来源未知"
+def _reference_links(result) -> list[tuple[str, str]]:
+    links = []
+    seen_urls = set()
+    seen_titles = set()
+    for entry in [*result.pages, *result.search_results]:
+        title_key = entry.title.casefold()
+        if entry.url in seen_urls or title_key in seen_titles:
+            continue
+        seen_urls.add(entry.url)
+        seen_titles.add(title_key)
+        links.append((entry.title, entry.url))
+    return links
 
 
 def _answer_with_history(
@@ -112,24 +118,21 @@ if prompt := st.chat_input("例如：打通里以撒解锁的那个换道具的�
                 )
                 response_text = result.answer
 
+                reference_links = _reference_links(result)
                 if getattr(result, "online_used", False):
-                    query_mode = "Agent 自主联网模式（本次访问了 wiki.gg，并更新本地缓存）"
-                elif getattr(result, "online_enabled", False):
-                    query_mode = "Agent 自主决策模式（本次仅使用本地数据库）"
+                    source_summary = "本次使用了 wiki.gg 在线内容。"
+                elif reference_links:
+                    source_summary = "本次使用了本地数据库内容；链接指向对应的 Wiki 原始页面。"
+                elif getattr(result, "memory_fallback", False):
+                    source_summary = "Wiki 数据未命中，本次回答由 Agent 已有的游戏知识补充。"
                 else:
-                    query_mode = "本地数据库模式（代码配置已关闭联网）"
-                response_text += f"\n\n**本次查询模式：** {query_mode}"
-                
-                # 如果你想在网页上展示它查了哪些网页，可以加上下面这段（可选）
-                if result.pages:
-                    sources = "\n\n**参考页面：**\n" + "\n".join(
-                        [
-                            f"- [{p.title}]({p.url})"
-                            f"（{_source_label(p.retrieved_from)}）"
-                            for p in result.pages
-                        ]
+                    source_summary = "本次未调用 Wiki 数据工具。"
+
+                response_text += f"\n\n---\n**数据来源：** {source_summary}"
+                if reference_links:
+                    response_text += "\n\n**Wiki 参考链接：**\n" + "\n".join(
+                        f"- [{title}]({url})" for title, url in reference_links
                     )
-                    response_text += sources
 
             except Exception as e:
                 response_text = f"抱歉，查询时出现了错误：{e}"

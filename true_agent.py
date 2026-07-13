@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 
@@ -24,6 +25,8 @@ class AgentAnswer:
     online_requested: bool = False
     online_enabled: bool = False
     online_used: bool = False
+    tools_used: bool = False
+    memory_fallback: bool = False
 
 # 核心：赋予大模型人设与行动指南
 SYSTEM_PROMPT = """你是一个精通《以撒的结合：忏悔》的资深 Wiki 助手。你的任务是通过调用工具，为玩家提供精准、详细的解答。
@@ -34,15 +37,15 @@ SYSTEM_PROMPT = """你是一个精通《以撒的结合：忏悔》的资深 Wik
 3. 优先使用本地数据库。只有本地信息缺失、明显不相关、需要核对最新内容，或用户明确要求核对网页时，才考虑联网。
 4. 没有联网权限时只能使用本地数据库，不得声称已经访问网页。
 5. 在线读取成功后会自动写回本地数据库，供后续查询复用。
-6. 工具结果会明确给出“来源路径”。回答信息来源问题时必须以该字段为准，不得声称程序没有本地数据库能力。
+6. 数据来源由交互界面统一附在回答末尾。除非用户明确询问，否则正文不要主动描述本地数据库、联网模式、缓存过程或来源链接。
 
 【行动指南】
 1. 意图分析：如果用户提问模糊（例如“吐绿水的苍蝇”或“通关里以撒解锁的道具”），请先利用你的内在游戏知识推测可能的道具/怪物/机制名称。
 2. 搜索（search_wiki）：利用推测出的关键词（中英文皆可），调用工具进行搜索。
 3. 读取（read_wiki_page）：分析搜索结果的标题，选取最相关的标题调用读取工具，获取页面正文。
-4. 验证与重试：如果读取的内容不包含用户需要的答案，你可以尝试搜索其他关键词并再次读取。
-5. 最终回答：基于你读取到的工具返回内容给出详细、准确的中文回答。不要编造游戏数据（无幻觉）。
-6. 如果用户输入“介绍你能做什么”或询问你的能力，请详细介绍可查询的角色、道具、怪物、Boss、机制与解锁内容，并如实说明当前联网权限。"""
+4. 验证与重试：如果读取的内容不包含用户需要的答案，你可以尝试搜索其他关键词并再次读取；不要重复调用同一个无结果的查询。
+5. 最终回答：优先基于工具内容给出准确的中文回答。如果数据库未命中或内容明显无关，可以使用你自身已有的《以撒的结合》游戏知识直接回答，但不要虚构不确定的精确数值。
+6. 如果用户输入“介绍你能做什么”或询问你的能力，请详细介绍可查询的角色、道具、怪物、Boss、机制与解锁内容。"""
 
 class IsaacWikiAgent:
     """基于 Tool-Calling 架构的以撒 Wiki 智能体"""
@@ -125,6 +128,8 @@ class IsaacWikiAgent:
         accumulated_search_results: list[SearchResult] = []
         accumulated_pages: list[WikiPage] = []
         online_used = False
+        tools_used = False
+        memory_fallback = False
 
         permission_prompt = (
             "当前联网权限：已开启。你可以自主决定将工具参数 online 设为 true，但应优先查询本地数据库。"
@@ -136,16 +141,32 @@ class IsaacWikiAgent:
             {"role": "system", "content": permission_prompt},
         ]
         if history:
-            messages.extend(
-                message
-                for message in history[-5:]
-                if message.get("role") in {"user", "assistant"} and message.get("content")
-            )
+            for message in history[-5:]:
+                if message.get("role") not in {"user", "assistant"}:
+                    continue
+                clean_content = _remove_dsml(str(message.get("content", ""))).strip()
+                if clean_content and not _contains_dsml(clean_content):
+                    messages.append({"role": message["role"], "content": clean_content})
         messages.append({"role": "user", "content": question})
 
         # 开启 ReAct (Reasoning and Acting) 循环，设置最大轮数防止死循环
         max_iterations = 6
         final_answer_text = ""
+
+        def execute_and_record(function_name: str, args: dict) -> str:
+            nonlocal memory_fallback, online_used, tools_used
+            tools_used = True
+            tool_result, results, page, used_online = self._execute_tool_call(
+                function_name,
+                args,
+            )
+            online_used = online_used or used_online
+            _extend_unique_results(accumulated_search_results, results)
+            if page and all(existing.url != page.url for existing in accumulated_pages):
+                accumulated_pages.append(page)
+            if function_name in {"search_wiki", "read_wiki_page"} and not results and page is None:
+                memory_fallback = True
+            return tool_result
 
         try:
             for iteration in range(max_iterations):
@@ -158,12 +179,45 @@ class IsaacWikiAgent:
                 )
                 
                 response_message = response.choices[0].message
+                response_content = response_message.content or ""
+                dsml_tool_calls = _parse_dsml_tool_calls(response_content)
+
+                if dsml_tool_calls and not response_message.tool_calls:
+                    tool_results = []
+                    for function_name, args in dsml_tool_calls:
+                        print(f"[Agent 思考中] 兼容执行: {function_name}, 参数: {args}")
+                        tool_results.append(
+                            f"{function_name}: {execute_and_record(function_name, args)}"
+                        )
+                    messages.append({"role": "assistant", "content": "我会结合查询结果继续回答。"})
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "以下是刚才内部工具的返回结果。请继续回答用户原问题，不要输出 DSML、XML、"
+                            "工具调用标签或调用参数。如果结果为空、报错或与问题无关，请停止重复检索，"
+                            "改用你自身已有的《以撒的结合》游戏知识自然作答。\n\n"
+                            + "\n\n".join(tool_results)
+                        ),
+                    })
+                    continue
+
+                if _contains_dsml(response_content):
+                    memory_fallback = True
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "上一条回复包含无法识别的内部工具标记。不要再次输出任何 DSML、XML 或工具标签；"
+                            "请直接根据已有资料和自身游戏知识回答用户原问题。"
+                        ),
+                    })
+                    continue
+
                 # 【修复核心】将对象转为纯字典，解决代理 API 兼容性导致的“失忆”问题
                 messages.append(response_message.model_dump(exclude_none=True))
 
                 # 如果模型没有调用工具，说明它认为已经收集到足够信息
                 if not response_message.tool_calls:
-                    final_answer_text = response_message.content
+                    final_answer_text = response_content.strip()
                     break
 
                 # 如果模型决定调用工具
@@ -171,44 +225,14 @@ class IsaacWikiAgent:
                     function_name = tool_call.function.name
                     
                     # 【增加监控】把 Agent 大脑里的想法打印在终端里！
-                    print(f"👀 [Agent 思考中] 决定调用: {function_name}, 参数: {tool_call.function.arguments}")
+                    print(f"[Agent 思考中] 决定调用: {function_name}, 参数: {tool_call.function.arguments}")
                     
                     try:
                         args = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError:
                         args = {}
 
-                    tool_result_str = ""
-
-                    if function_name == "search_wiki":
-                        query = args.get("query", "")
-                        use_online = self.allow_online and bool(args.get("online", False))
-                        online_used = online_used or use_online
-                        tool_result_str, results = self._tool_search_wiki(
-                            query,
-                            use_online=use_online,
-                        )
-                        _extend_unique_results(accumulated_search_results, results)
-                        online_used = online_used or any(
-                            result.retrieved_from == "remote_api" for result in results
-                        )
-                        
-                    elif function_name == "read_wiki_page":
-                        title = args.get("title", "")
-                        use_online = self.allow_online and bool(args.get("online", False))
-                        online_used = online_used or use_online
-                        tool_result_str, page = self._tool_read_wiki_page(
-                            title,
-                            use_online=use_online,
-                        )
-                        if page and all(existing.url != page.url for existing in accumulated_pages):
-                            accumulated_pages.append(page)
-                        online_used = online_used or bool(
-                            page and page.retrieved_from == "remote_api"
-                        )
-                            
-                    else:
-                        tool_result_str = f"错误：未知的工具调用 '{function_name}'"
+                    tool_result_str = execute_and_record(function_name, args)
 
                     # 将工具执行的结果追加到历史记录中，供大模型下一步判断
                     messages.append({
@@ -217,10 +241,31 @@ class IsaacWikiAgent:
                         "name": function_name,
                         "content": tool_result_str
                     })
+
+            if not final_answer_text:
+                memory_fallback = True
+                fallback_response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages + [{
+                        "role": "system",
+                        "content": (
+                            "现在停止调用工具，直接回答用户最初的问题。可以使用你自身已有的《以撒的结合》"
+                            "游戏知识补充数据库缺失内容。只输出自然的中文答案，不要输出 DSML、XML 或工具标签。"
+                        ),
+                    }],
+                )
+                final_answer_text = _remove_dsml(
+                    fallback_response.choices[0].message.content or ""
+                ).strip()
+                if _contains_dsml(final_answer_text):
+                    final_answer_text = ""
         except APIError as exc:
             final_answer_text = f"调用大模型 API 时发生错误：{exc}\n\n请检查 API Key 状态或网络连通性。"
         except Exception as exc:
             final_answer_text = f"代理执行过程中发生未处理异常：{exc}"
+
+        if not final_answer_text:
+            final_answer_text = "我暂时无法生成可靠答案，请换一种说法后再试。"
 
         return AgentAnswer(
             question=question,
@@ -231,7 +276,35 @@ class IsaacWikiAgent:
             online_requested=online_used,
             online_enabled=self.allow_online,
             online_used=online_used,
+            tools_used=tools_used,
+            memory_fallback=memory_fallback,
         )
+
+    def _execute_tool_call(
+        self,
+        function_name: str,
+        args: dict,
+    ) -> tuple[str, list[SearchResult], WikiPage | None, bool]:
+        use_online = self.allow_online and _as_bool(args.get("online", False))
+        if function_name == "search_wiki":
+            tool_result, results = self._tool_search_wiki(
+                str(args.get("query", "")),
+                use_online=use_online,
+            )
+            used_online = use_online or any(
+                result.retrieved_from == "remote_api" for result in results
+            )
+            return tool_result, results, None, used_online
+        if function_name == "read_wiki_page":
+            tool_result, page = self._tool_read_wiki_page(
+                str(args.get("title", "")),
+                use_online=use_online,
+            )
+            used_online = use_online or bool(
+                page and page.retrieved_from == "remote_api"
+            )
+            return tool_result, [], page, used_online
+        return f"错误：未知的工具调用 '{function_name}'", [], None, False
 
     def _tool_search_wiki(
         self,
@@ -246,21 +319,21 @@ class IsaacWikiAgent:
             results = search_wiki(query, limit=5, allow_remote=use_online)
             if not results:
                 if use_online:
-                    return f"在线 Wiki 未找到关于 '{query}' 的结果。", []
+                    return (
+                        f"在线 Wiki 未找到关于 '{query}' 的结果。请停止重复检索，改用已有游戏知识回答。",
+                        [],
+                    )
                 return (
-                    f"本地数据库未找到关于 '{query}' 的结果。本次没有访问互联网。",
+                    f"本地数据库未找到关于 '{query}' 的结果。请停止重复检索，改用已有游戏知识回答。",
                     [],
                 )
             
             # 将结果格式化为大模型易于理解的纯文本
             formatted_text = f"关于 '{query}' 的搜索结果如下：\n"
             for i, res in enumerate(results, start=1):
-                route = _source_route_label(res.retrieved_from)
                 formatted_text += (
                     f"{i}. 标题: {res.title}\n"
                     f"   摘要: {res.snippet}\n"
-                    f"   来源路径: {route}\n"
-                    f"   原始数据源: {res.source or res.url}\n"
                 )
             return formatted_text, results
         except WikiApiError as exc:
@@ -279,25 +352,59 @@ class IsaacWikiAgent:
             page = get_wiki_page(title, allow_remote=use_online)
             # 限制返回给大模型的字符数，防止超长报错
             extract_text = page.extract[:8000] if page.extract else "（该页面没有正文内容）"
-            route = _source_route_label(page.retrieved_from)
             formatted_text = (
                 f"页面 '{page.title}' 的正文内容摘录：\n"
-                f"来源路径: {route}\n"
-                f"原始数据源: {page.source or page.url}\n\n"
                 f"{extract_text}"
             )
             return formatted_text, page
         except WikiApiError as exc:
-            return f"读取页面 '{title}' 失败，请检查标题是否完全一致（错误信息：{exc}）。", None
+            return (
+                f"读取页面 '{title}' 失败（错误信息：{exc}）。请停止重复读取，改用已有游戏知识回答。",
+                None,
+            )
 
 
-def _source_route_label(retrieved_from: str) -> str:
-    if retrieved_from == "local_database":
-        return "本地 SQLite 数据库（本次未访问网页）"
-    if retrieved_from == "remote_api":
-        return "在线 wiki.gg API（Agent 自主决定联网）"
-    return "未知"
+_DSML_INVOKE_PATTERN = re.compile(
+    r'<[|｜]{2}DSML[|｜]{2}invoke\s+name=["\']([^"\']+)["\'][^>]*>'
+    r'(.*?)</[|｜]{2}DSML[|｜]{2}invoke>',
+    re.DOTALL | re.IGNORECASE,
+)
+_DSML_PARAMETER_PATTERN = re.compile(
+    r'<[|｜]{2}DSML[|｜]{2}parameter\s+name=["\']([^"\']+)["\'][^>]*>'
+    r'(.*?)</[|｜]{2}DSML[|｜]{2}parameter>',
+    re.DOTALL | re.IGNORECASE,
+)
+_DSML_BLOCK_PATTERN = re.compile(
+    r'<[|｜]{2}DSML[|｜]{2}tool_calls[^>]*>.*?'
+    r'</[|｜]{2}DSML[|｜]{2}tool_calls>',
+    re.DOTALL | re.IGNORECASE,
+)
 
+
+def _parse_dsml_tool_calls(content: str) -> list[tuple[str, dict[str, str]]]:
+    calls = []
+    for invoke_match in _DSML_INVOKE_PATTERN.finditer(content):
+        function_name = invoke_match.group(1).strip()
+        arguments = {
+            parameter_match.group(1).strip(): parameter_match.group(2).strip()
+            for parameter_match in _DSML_PARAMETER_PATTERN.finditer(invoke_match.group(2))
+        }
+        calls.append((function_name, arguments))
+    return calls
+
+
+def _contains_dsml(content: str) -> bool:
+    return bool(re.search(r'[|｜]{2}DSML[|｜]{2}', content, re.IGNORECASE))
+
+
+def _remove_dsml(content: str) -> str:
+    return _DSML_BLOCK_PATTERN.sub("", content)
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"1", "true", "yes", "on"}
 
 def _extend_unique_results(
     existing: list[SearchResult],
