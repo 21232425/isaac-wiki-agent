@@ -5,6 +5,15 @@ import secrets
 import streamlit as st
 from true_agent import IsaacWikiAgent  # 直接引入你写好的 Agent
 
+
+def _source_label(retrieved_from: str) -> str:
+    if retrieved_from == "local_database":
+        return "本地数据库"
+    if retrieved_from == "remote_api":
+        return "在线 Wiki 兜底并已缓存"
+    return "来源未知"
+
+
 # 设置网页标题和布局
 st.set_page_config(page_title="以撒 Wiki 智能助手", page_icon="👼", layout="centered")
 
@@ -69,12 +78,21 @@ if prompt := st.chat_input("例如：打通里以撒解锁的那个换道具的�
         with st.spinner("Agent 正在翻阅 Wiki 思考中，请稍候..."):
             try:
                 # 调用 true_agent.py 中的 answer 方法
-                result = st.session_state.agent.answer(prompt)
+                result = st.session_state.agent.answer(
+                    prompt,
+                    history=st.session_state.messages[:-1],
+                )
                 response_text = result.answer
                 
                 # 如果你想在网页上展示它查了哪些网页，可以加上下面这段（可选）
                 if result.pages:
-                    sources = "\n\n**参考页面：**\n" + "\n".join([f"- [{p.title}]({p.url})" for p in result.pages])
+                    sources = "\n\n**参考页面：**\n" + "\n".join(
+                        [
+                            f"- [{p.title}]({p.url})"
+                            f"（{_source_label(p.retrieved_from)}）"
+                            for p in result.pages
+                        ]
+                    )
                     response_text += sources
 
             except Exception as e:

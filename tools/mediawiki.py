@@ -26,6 +26,8 @@ class SearchResult:
     snippet: str
     pageid: int | None = None
     page_url: str | None = None
+    source: str = ""
+    retrieved_from: str = "unknown"
 
     @property
     def url(self) -> str:
@@ -38,6 +40,8 @@ class WikiPage:
     extract: str
     url: str
     pageid: int | None = None
+    source: str = ""
+    retrieved_from: str = "unknown"
 
 
 class WikiApiError(RuntimeError):
@@ -54,6 +58,8 @@ def search_wiki(query: str, limit: int = 5) -> list[SearchResult]:
                 snippet=_matching_snippet(page.extract, query),
                 pageid=page.pageid,
                 page_url=page.url,
+                source=page.source,
+                retrieved_from="local_database",
             )
             for page in local_results
         ]
@@ -89,6 +95,8 @@ def search_wiki(query: str, limit: int = 5) -> list[SearchResult]:
                     snippet=_clean_html(row.get("snippet", "")),
                     pageid=row.get("pageid"),
                     page_url=_page_url(api_url, title),
+                    source=api_url,
+                    retrieved_from="remote_api",
                 )
             )
             if len(merged) >= limit:
@@ -105,7 +113,7 @@ def get_wiki_page(title: str) -> WikiPage:
     """Read an exact local page first; fetch and cache it only when absent."""
     local_page = get_page(title)
     if local_page is not None:
-        return _stored_to_wiki_page(local_page)
+        return _stored_to_wiki_page(local_page, retrieved_from="local_database")
 
     errors: list[str] = []
     for api_url in _remote_apis():
@@ -143,7 +151,7 @@ def get_wiki_page(title: str) -> WikiPage:
             pageid=page.get("pageid"),
         )
         upsert_page(stored)
-        return _stored_to_wiki_page(stored)
+        return _stored_to_wiki_page(stored, retrieved_from="remote_api")
 
     detail = f"（{'；'.join(errors)}）" if errors else ""
     raise WikiApiError(f"本地数据库和在线 Wiki 都没有页面：{title}{detail}")
@@ -191,12 +199,14 @@ def _page_url(api_url: str, title: str) -> str:
     return f"{script_path}/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
 
 
-def _stored_to_wiki_page(page: StoredPage) -> WikiPage:
+def _stored_to_wiki_page(page: StoredPage, retrieved_from: str) -> WikiPage:
     return WikiPage(
         title=page.title,
         extract=page.extract,
         url=page.url,
         pageid=page.pageid,
+        source=page.source,
+        retrieved_from=retrieved_from,
     )
 
 

@@ -21,6 +21,12 @@ class AgentAnswer:
 # 核心：赋予大模型人设与行动指南
 SYSTEM_PROMPT = """你是一个精通《以撒的结合：忏悔》的资深 Wiki 助手。你的任务是通过调用工具，为玩家提供精准、详细的解答。
 
+【数据源架构】
+1. search_wiki 和 read_wiki_page 都由程序实现为“本地 SQLite 数据库优先”。
+2. 只有本地数据库没有命中时，工具才会访问 wiki.gg 的公开 MediaWiki API。
+3. 在线读取成功后会自动写回本地数据库，供后续查询复用。
+4. 工具结果会明确给出“来源路径”。回答信息来源问题时必须以该字段为准，不得声称程序没有本地数据库能力。
+
 【行动指南】
 1. 意图分析：如果用户提问模糊（例如“吐绿水的苍蝇”或“通关里以撒解锁的道具”），请先利用你的内在游戏知识推测可能的道具/怪物/机制名称。
 2. 搜索（search_wiki）：利用推测出的关键词（中英文皆可），调用工具进行搜索。
@@ -84,15 +90,23 @@ class IsaacWikiAgent:
             }
         ]
 
-    def answer(self, question: str) -> AgentAnswer:
+    def answer(
+        self,
+        question: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> AgentAnswer:
         # 用于追踪本次对话中大模型调用了哪些结果，保留你原有的数据结构返回
         accumulated_search_results: list[SearchResult] = []
         accumulated_pages: list[WikiPage] = []
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question}
-        ]
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if history:
+            messages.extend(
+                message
+                for message in history[-10:]
+                if message.get("role") in {"user", "assistant"} and message.get("content")
+            )
+        messages.append({"role": "user", "content": question})
 
         # 开启 ReAct (Reasoning and Acting) 循环，设置最大轮数防止死循环
         max_iterations = 6
@@ -179,7 +193,13 @@ class IsaacWikiAgent:
             # 将结果格式化为大模型易于理解的纯文本
             formatted_text = f"关于 '{query}' 的搜索结果如下：\n"
             for i, res in enumerate(results, start=1):
-                formatted_text += f"{i}. 标题: {res.title}\n   摘要: {res.snippet}\n"
+                route = _source_route_label(res.retrieved_from)
+                formatted_text += (
+                    f"{i}. 标题: {res.title}\n"
+                    f"   摘要: {res.snippet}\n"
+                    f"   来源路径: {route}\n"
+                    f"   原始数据源: {res.source or res.url}\n"
+                )
             return formatted_text, results
         except WikiApiError as exc:
             return f"执行 Wiki 搜索 API 失败：{exc}", []
@@ -192,10 +212,24 @@ class IsaacWikiAgent:
             page = get_wiki_page(title)
             # 限制返回给大模型的字符数，防止超长报错
             extract_text = page.extract[:8000] if page.extract else "（该页面没有正文内容）"
-            formatted_text = f"页面 '{page.title}' 的正文内容摘录：\n\n{extract_text}"
+            route = _source_route_label(page.retrieved_from)
+            formatted_text = (
+                f"页面 '{page.title}' 的正文内容摘录：\n"
+                f"来源路径: {route}\n"
+                f"原始数据源: {page.source or page.url}\n\n"
+                f"{extract_text}"
+            )
             return formatted_text, page
         except WikiApiError as exc:
             return f"读取页面 '{title}' 失败，请检查标题是否完全一致（错误信息：{exc}）。", None
+
+
+def _source_route_label(retrieved_from: str) -> str:
+    if retrieved_from == "local_database":
+        return "本地 SQLite 数据库"
+    if retrieved_from == "remote_api":
+        return "在线 wiki.gg API（本地未命中后兜底）"
+    return "未知"
 
 
 def run_once(question: str) -> None:
