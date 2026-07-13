@@ -2,9 +2,9 @@
 
 这个项目使用 DeepSeek Tool Calling 回答《以撒的结合》问题。Wiki 工具现在采用以下顺序：
 
-1. 默认只查询本地 SQLite 数据库 `data/isaac_wiki.sqlite3`。
-2. 只有用户明确要求“请联网搜索”等操作时，才强制查询公开的 `wiki.gg` MediaWiki API，并用当前正文更新缓存。
-3. 在线读取成功后自动写回 SQLite，后续相同查询直接走本地。
+1. 是否允许联网由 `true_agent.py` 顶部的 `ALLOW_ONLINE_WIKI` 控制，默认值为 `False`。
+2. 设为 `True` 后，Agent 会优先查询本地 SQLite，并在本地结果不足或需要核对时自主决定是否访问公开的 `wiki.gg` MediaWiki API。
+3. 在线读取成功后自动写回 SQLite，后续可从本地复用。
 
 原先使用的灰机 Wiki API 会对脚本请求返回 HTTP 403。伪造浏览器请求头并不是稳定或合适的解决方式，所以默认在线源已改为公开 API 可正常访问的 `wiki.gg`。
 

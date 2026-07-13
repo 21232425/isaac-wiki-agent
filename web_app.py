@@ -4,17 +4,17 @@ import secrets
 import inspect
 
 import streamlit as st
-from true_agent import IsaacWikiAgent, online_search_requested
+from true_agent import IsaacWikiAgent
 
 
-AGENT_STATE_VERSION = 4
+AGENT_STATE_VERSION = 5
 
 
 def _source_label(retrieved_from: str) -> str:
     if retrieved_from == "local_database":
         return "本次从本地数据库读取；链接仅用于原始来源署名"
     if retrieved_from == "remote_api":
-        return "本次按指令从 wiki.gg 联网读取，并已写入缓存"
+        return "本次由 Agent 从 wiki.gg 联网读取，并已写入缓存"
     return "来源未知"
 
 
@@ -22,14 +22,11 @@ def _answer_with_history(
     agent,
     prompt: str,
     history: list[dict[str, str]],
-    allow_online: bool,
 ):
     parameters = inspect.signature(agent.answer).parameters
     keyword_arguments = {}
     if "history" in parameters:
         keyword_arguments["history"] = history
-    if "allow_online" in parameters:
-        keyword_arguments["allow_online"] = allow_online
     return agent.answer(prompt, **keyword_arguments)
 
 
@@ -68,7 +65,7 @@ if not st.session_state.authenticated:
 
 # 下方的代码只有在 st.session_state.authenticated 为 True 时才会执行
 st.title("👼 以撒的结合 Wiki 智能助手")
-st.caption("默认仅查询本地数据库；如需访问 wiki.gg，请在问题中明确写“请联网搜索”。")
+st.caption("Agent 会根据代码中的联网权限自主选择数据源；当前默认仅查询本地数据库。")
 
 # 初始化或更新 session_state 中的 Agent 实例。
 # 版本号可避免代码热更新后继续使用旧类创建的实例。
@@ -82,7 +79,13 @@ if (
 # 初始化聊天历史记录
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "你好！我是以撒 Wiki 助手。想查什么道具、Boss 或机制？直接问我吧！"}
+        {
+            "role": "assistant",
+            "content": (
+                "你好！我是以撒 Wiki 助手。想查什么道具、Boss 或机制？直接问我吧！\n\n"
+                "你可以输入“介绍你能做什么”来详细了解我哦。"
+            ),
+        }
     ]
 
 # 渲染历史聊天记录
@@ -102,19 +105,19 @@ if prompt := st.chat_input("例如：打通里以撒解锁的那个换道具的�
         with st.spinner("Agent 正在翻阅 Wiki 思考中，请稍候..."):
             try:
                 # 调用 true_agent.py 中的 answer 方法
-                online_requested = online_search_requested(prompt)
                 result = _answer_with_history(
                     st.session_state.agent,
                     prompt,
                     st.session_state.messages[:-1],
-                    allow_online=online_requested,
                 )
                 response_text = result.answer
 
-                if online_requested:
-                    query_mode = "联网模式（按指令强制访问 wiki.gg，并更新本地缓存）"
+                if getattr(result, "online_used", False):
+                    query_mode = "Agent 自主联网模式（本次访问了 wiki.gg，并更新本地缓存）"
+                elif getattr(result, "online_enabled", False):
+                    query_mode = "Agent 自主决策模式（本次仅使用本地数据库）"
                 else:
-                    query_mode = "本地数据库模式（未授权访问网页）"
+                    query_mode = "本地数据库模式（代码配置已关闭联网）"
                 response_text += f"\n\n**本次查询模式：** {query_mode}"
                 
                 # 如果你想在网页上展示它查了哪些网页，可以加上下面这段（可选）
