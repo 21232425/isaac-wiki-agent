@@ -48,8 +48,12 @@ class WikiApiError(RuntimeError):
     """Raised when neither the local database nor a remote wiki returns content."""
 
 
-def search_wiki(query: str, limit: int = 5) -> list[SearchResult]:
-    """Search SQLite first and use a public MediaWiki API only on a local miss."""
+def search_wiki(
+    query: str,
+    limit: int = 5,
+    allow_remote: bool = False,
+) -> list[SearchResult]:
+    """Search SQLite and only use MediaWiki when explicitly allowed."""
     local_results = search_pages(query, limit=limit)
     if local_results:
         return [
@@ -63,6 +67,9 @@ def search_wiki(query: str, limit: int = 5) -> list[SearchResult]:
             )
             for page in local_results
         ]
+
+    if not allow_remote:
+        return []
 
     errors: list[str] = []
     merged: list[SearchResult] = []
@@ -109,11 +116,14 @@ def search_wiki(query: str, limit: int = 5) -> list[SearchResult]:
     return []
 
 
-def get_wiki_page(title: str) -> WikiPage:
-    """Read an exact local page first; fetch and cache it only when absent."""
+def get_wiki_page(title: str, allow_remote: bool = False) -> WikiPage:
+    """Read SQLite first and fetch remotely only when explicitly allowed."""
     local_page = get_page(title)
     if local_page is not None:
         return _stored_to_wiki_page(local_page, retrieved_from="local_database")
+
+    if not allow_remote:
+        raise WikiApiError(f"本地数据库没有页面：{title}；当前查询未启用联网模式")
 
     errors: list[str] = []
     for api_url in _remote_apis():

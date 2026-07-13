@@ -7,12 +7,12 @@ import streamlit as st
 from true_agent import IsaacWikiAgent  # 直接引入你写好的 Agent
 
 
-AGENT_STATE_VERSION = 2
+AGENT_STATE_VERSION = 3
 
 
 def _source_label(retrieved_from: str) -> str:
     if retrieved_from == "local_database":
-        return "本地数据库"
+        return "本次从本地数据库读取；链接仅用于原始来源署名"
     if retrieved_from == "remote_api":
         return "在线 Wiki 兜底并已缓存"
     return "来源未知"
@@ -60,7 +60,7 @@ if not st.session_state.authenticated:
 
 # 下方的代码只有在 st.session_state.authenticated 为 True 时才会执行
 st.title("👼 以撒的结合 Wiki 智能助手")
-st.caption("基于 DeepSeek 与 Tool-Calling 架构，优先检索本地 Wiki 数据库，未命中时访问 wiki.gg。")
+st.caption("默认仅查询本地数据库；如需访问 wiki.gg，请在问题中明确写“请联网搜索”。")
 
 # 初始化或更新 session_state 中的 Agent 实例。
 # 版本号可避免代码热更新后继续使用旧类创建的实例。
@@ -100,6 +100,12 @@ if prompt := st.chat_input("例如：打通里以撒解锁的那个换道具的�
                     st.session_state.messages[:-1],
                 )
                 response_text = result.answer
+
+                if getattr(result, "online_requested", False):
+                    query_mode = "联网模式（本地未命中时允许访问 wiki.gg）"
+                else:
+                    query_mode = "本地数据库模式（未授权访问网页）"
+                response_text += f"\n\n**本次查询模式：** {query_mode}"
                 
                 # 如果你想在网页上展示它查了哪些网页，可以加上下面这段（可选）
                 if result.pages:

@@ -17,13 +17,14 @@ class AgentAnswer:
     page: WikiPage | None
     pages: list[WikiPage]
     answer: str
+    online_requested: bool = False
 
 # 核心：赋予大模型人设与行动指南
 SYSTEM_PROMPT = """你是一个精通《以撒的结合：忏悔》的资深 Wiki 助手。你的任务是通过调用工具，为玩家提供精准、详细的解答。
 
 【数据源架构】
-1. search_wiki 和 read_wiki_page 都由程序实现为“本地 SQLite 数据库优先”。
-2. 只有本地数据库没有命中时，工具才会访问 wiki.gg 的公开 MediaWiki API。
+1. 默认模式是严格离线：search_wiki 和 read_wiki_page 只读取本地 SQLite 数据库。
+2. 只有用户在当前问题中明确要求“联网搜索、上网查、在线查询”等操作时，程序才允许在本地未命中后访问 wiki.gg API。
 3. 在线读取成功后会自动写回本地数据库，供后续查询复用。
 4. 工具结果会明确给出“来源路径”。回答信息来源问题时必须以该字段为准，不得声称程序没有本地数据库能力。
 
@@ -98,6 +99,7 @@ class IsaacWikiAgent:
         # 用于追踪本次对话中大模型调用了哪些结果，保留你原有的数据结构返回
         accumulated_search_results: list[SearchResult] = []
         accumulated_pages: list[WikiPage] = []
+        online_requested = _online_search_requested(question)
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
@@ -146,13 +148,19 @@ class IsaacWikiAgent:
 
                     if function_name == "search_wiki":
                         query = args.get("query", "")
-                        tool_result_str, results = self._tool_search_wiki(query)
-                        accumulated_search_results.extend(results)
+                        tool_result_str, results = self._tool_search_wiki(
+                            query,
+                            allow_online=online_requested,
+                        )
+                        _extend_unique_results(accumulated_search_results, results)
                         
                     elif function_name == "read_wiki_page":
                         title = args.get("title", "")
-                        tool_result_str, page = self._tool_read_wiki_page(title)
-                        if page:
+                        tool_result_str, page = self._tool_read_wiki_page(
+                            title,
+                            allow_online=online_requested,
+                        )
+                        if page and all(existing.url != page.url for existing in accumulated_pages):
                             accumulated_pages.append(page)
                             
                     else:
@@ -178,17 +186,28 @@ class IsaacWikiAgent:
             search_results=accumulated_search_results,
             page=accumulated_pages[0] if accumulated_pages else None,
             pages=accumulated_pages,
-            answer=final_answer_text
+            answer=final_answer_text,
+            online_requested=online_requested,
         )
 
-    def _tool_search_wiki(self, query: str) -> tuple[str, list[SearchResult]]:
+    def _tool_search_wiki(
+        self,
+        query: str,
+        allow_online: bool = False,
+    ) -> tuple[str, list[SearchResult]]:
         """封装 search_wiki 供大模型调用，返回 (供大模型阅读的文本, 原始数据对象)"""
         if not query:
             return "错误：搜索关键词不能为空。", []
         try:
-            results = search_wiki(query, limit=5)
+            results = search_wiki(query, limit=5, allow_remote=allow_online)
             if not results:
-                return f"未找到关于 '{query}' 的搜索结果，请尝试其他关键词。", []
+                if allow_online:
+                    return f"本地数据库和在线 Wiki 都未找到关于 '{query}' 的结果。", []
+                return (
+                    f"本地数据库未找到关于 '{query}' 的结果。当前是默认本地模式，"
+                    "没有访问互联网；如需联网，请在问题中明确写‘请联网搜索’。",
+                    [],
+                )
             
             # 将结果格式化为大模型易于理解的纯文本
             formatted_text = f"关于 '{query}' 的搜索结果如下：\n"
@@ -204,12 +223,16 @@ class IsaacWikiAgent:
         except WikiApiError as exc:
             return f"执行 Wiki 搜索 API 失败：{exc}", []
 
-    def _tool_read_wiki_page(self, title: str) -> tuple[str, WikiPage | None]:
+    def _tool_read_wiki_page(
+        self,
+        title: str,
+        allow_online: bool = False,
+    ) -> tuple[str, WikiPage | None]:
         """封装 get_wiki_page 供大模型调用，返回 (供大模型阅读的正文, 原始数据对象)"""
         if not title:
             return "错误：页面标题不能为空。", None
         try:
-            page = get_wiki_page(title)
+            page = get_wiki_page(title, allow_remote=allow_online)
             # 限制返回给大模型的字符数，防止超长报错
             extract_text = page.extract[:8000] if page.extract else "（该页面没有正文内容）"
             route = _source_route_label(page.retrieved_from)
@@ -226,10 +249,44 @@ class IsaacWikiAgent:
 
 def _source_route_label(retrieved_from: str) -> str:
     if retrieved_from == "local_database":
-        return "本地 SQLite 数据库"
+        return "本地 SQLite 数据库（本次未访问网页）"
     if retrieved_from == "remote_api":
         return "在线 wiki.gg API（本地未命中后兜底）"
     return "未知"
+
+
+def _online_search_requested(question: str) -> bool:
+    normalized = question.casefold().strip()
+    offline_phrases = ("不要联网", "不用联网", "禁止联网", "仅本地", "只查本地", "离线查询")
+    if any(phrase in normalized for phrase in offline_phrases):
+        return False
+    online_phrases = (
+        "请联网",
+        "联网搜索",
+        "联网查询",
+        "上网查",
+        "上网搜索",
+        "在线搜索",
+        "在线查询",
+        "访问wiki",
+        "访问 wiki",
+        "查一下网页",
+        "搜索网页",
+        "/online",
+    )
+    return any(phrase in normalized for phrase in online_phrases)
+
+
+def _extend_unique_results(
+    existing: list[SearchResult],
+    new_results: list[SearchResult],
+) -> None:
+    seen = {(result.title.casefold(), result.url) for result in existing}
+    for result in new_results:
+        key = (result.title.casefold(), result.url)
+        if key not in seen:
+            existing.append(result)
+            seen.add(key)
 
 
 def run_once(question: str) -> None:
